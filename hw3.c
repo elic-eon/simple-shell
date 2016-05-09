@@ -7,6 +7,9 @@
 #include <signal.h>
 #include <errno.h>
 #include <termios.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <glob.h>
 
 #define TOK_DELIM " \t\r\n\a"
 
@@ -15,19 +18,31 @@ static pid_t SH_PGID;
 static struct termios SH_TMODES;
 pid_t child_pid;
 struct sigaction act_int;
+struct sigaction act_quit;
 struct sigaction act_chld;
 int no_reprint;
+pid_t new_pgrp;
+int shell_termial;
 
 void sigchld_handler (int sig) {
     while (waitpid(-1, NULL, WNOHANG) > 0);
 }
 void sigint_handler (int sig) {
-    if (kill(child_pid, SIGTERM) == 0) {
+    if (new_pgrp > 0 && killpg(new_pgrp, SIGTERM) == 0) {
         printf("kill: %d\n", child_pid);
         no_reprint = 1;
     }
     else {
-        printf(" int \n");
+        printf("int \n");
+    }
+}
+void sigquit_handler (int sig) {
+    if (kill(child_pid, SIGQUIT) == 0) {
+        printf("kill: %d\n", child_pid);
+        no_reprint = 1;
+    }
+    else {
+        printf("quit \n");
     }
 }
 
@@ -37,7 +52,8 @@ void printPrompt(void);
 void toArgv(char *buffer, char **argv);
 int lunchCmd(char *tokens[]);
 int isBackground(char *tokens[], int l);
-void lunchProg(char *tokens[], int isBackground);
+void lunchProg(char *tokens[], int l, int isBackground);
+int spawn_proc(int in, int out, char **argv, int isBackground);
 
 int main() {
     initialize();
@@ -46,26 +62,28 @@ int main() {
 }
 
 void initialize(void) {
+    shell_termial = STDIN_FILENO;
     child_pid = -10;
     no_reprint = 0;
     SH_PID = getpid();
 
-    while (tcgetpgrp(STDIN_FILENO) != (SH_PGID = getpgrp()))
+    while (tcgetpgrp(shell_termial) != (SH_PGID = getpgrp()))
             kill(SH_PID, SIGTTIN);             
 
     act_chld.sa_handler = sigchld_handler;
     act_int.sa_handler = sigint_handler;
+    act_quit.sa_handler = sigquit_handler;
 
     sigaction(SIGCHLD, &act_chld, 0);
     sigaction(SIGINT, &act_int, 0);
+    sigaction(SIGQUIT, &act_quit, 0);
+    signal(SIGTTOU, SIG_IGN);
 
     setpgid(SH_PID, SH_PID);
     SH_PGID = getpgrp();
 
-    tcsetpgrp(STDIN_FILENO, SH_PGID);
-    tcgetattr(STDIN_FILENO, &SH_TMODES);
-    /*tcgetattr()*/
-    /*printf("init ok\n");*/
+    tcsetpgrp(shell_termial, SH_PGID);
+    tcgetattr(shell_termial, &SH_TMODES);
 
     setenv("OLDPWD", "", 1);
     
@@ -77,12 +95,12 @@ void sh_loop(void) {
     int inStatus;
 
     do {
-        if (!no_reprint) printPrompt();
+        if (!no_reprint) {
+            printPrompt();
+        }
         no_reprint = 0;
         memset(buffer, '\0', sizeof(buffer));
         inStatus = fgets(buffer, sizeof(buffer), stdin) ? 1 : 0;
-        /*printf("\nbuf: %s, s: %d, errno :%d, feof: %d\n",*/
-                /*buffer, inStatus, errno, feof(stdin));*/
         // reach eof or C-D
         if (feof(stdin)) break;
         // fgets interrupted
@@ -92,9 +110,9 @@ void sh_loop(void) {
         // fgets correct
         if (inStatus) {
             toArgv(buffer, tokens);
+            new_pgrp = 0;
             lunchCmd(tokens);
         }
-        /*printf("%d", inStatus);*/
     } while (1);
 }
 
@@ -112,16 +130,12 @@ void toArgv(char *buffer, char **argv) {
 }
 
 int lunchCmd(char *tokens[]) {
-    char *argv[64];
     int lengthOfTokens = 0;
     char cwd[1024] = "";
     getcwd(cwd, sizeof(cwd));
-    int background = 0;
 
     /* find token length */
     for (; tokens[lengthOfTokens] != NULL; lengthOfTokens++) ;
-
-    /*printf("%d\n", lengthOfTokens);*/
 
     /* no input */
     if (lengthOfTokens == 0) {
@@ -158,7 +172,9 @@ int lunchCmd(char *tokens[]) {
         }
         return 1;
     }
-    lunchProg(tokens, isBackground(tokens, lengthOfTokens));
+    int b = isBackground(tokens, lengthOfTokens);
+    if (b) lengthOfTokens--;
+    lunchProg(tokens, lengthOfTokens,b);
     return 1;
 }
 
@@ -172,25 +188,114 @@ int isBackground(char *tokens[], int l) {
     }
 }
 
-void lunchProg(char *tokens[], int isBackground) {
-    if ((child_pid = fork()) == -1) {
-        printf("ysh: fork: Resource temporarily unavailable");
-        return;
+int spawn_proc(int in, int out, char **argv, int isBackground) {
+    pid_t pid;
+    glob_t globbuf;
+    char *name = argv[0];
+    int i;
+    glob(name, GLOB_NOCHECK, NULL, &globbuf);
+    for (name = argv[1], i = 1; name != NULL; i++, name = argv[i]) {
+        glob(name, GLOB_NOCHECK | GLOB_APPEND | GLOB_TILDE, NULL, &globbuf);
     }
-    if (child_pid == 0) {                   // child
-        signal(SIGINT, SIG_IGN);
 
-        if (execvp(tokens[0], tokens) == -1) {
-            fprintf(stderr, "ysh: Command not found: %s\n", tokens[0]);
-            kill(getpid(), SIGTERM);
+    if ((pid = fork ()) == 0) { // child
+        pid = getpid();
+        if (new_pgrp == 0) {
+            new_pgrp = pid;
         }
+        setpgid(pid, new_pgrp);
+        if (!isBackground) {
+            tcsetpgrp(shell_termial, new_pgrp);
+        }
+        if (in != STDIN_FILENO) {
+            dup2 (in, 0);
+            close (in);
+        }
+        if (out != STDOUT_FILENO) { 
+            dup2 (out, 1);
+            close (out);
+        }
+        return execvp(globbuf.gl_pathv[0], (char * const *)globbuf.gl_pathv);
     }
-    else {                                  // parent
+    else if (pid > 0) {
         if (isBackground) {
-            printf("[%d] %d\n", 1, child_pid);
+            printf("[%d] %d", 1, pid);
+        }
+        if (new_pgrp == 0) {
+            new_pgrp = pid;
+        }
+        setpgid(pid, new_pgrp);
+    }
+
+    return pid;
+}
+
+void lunchProg(char *tokens[], int l, int isBackground) {
+    int fd = STDIN_FILENO;
+    int fds[2];
+    int in, out;
+    char *outputFile = NULL;
+    char *inputFile = NULL;
+    char *arrayOfArgs[64][64];
+    int numOfPIPE = 0;
+    memset(arrayOfArgs, 0, sizeof(arrayOfArgs));
+    for (int i = 0, j = 0; i < l; i++) {
+        if (strcmp("<", tokens[i]) == 0) {
+            inputFile = tokens[++i];
+        }
+        else if (strcmp(">", tokens[i]) == 0) {
+            outputFile = tokens[++i];
+        }
+        else if (strcmp("|", tokens[i]) == 0) {
+            arrayOfArgs[numOfPIPE][j] = NULL;
+            numOfPIPE++;
+            j = 0;
         }
         else {
-            waitpid(child_pid, NULL, 0);
+            arrayOfArgs[numOfPIPE][j++] = tokens[i];
         }
+    }
+
+    in = dup(STDIN_FILENO);
+    out = dup(STDOUT_FILENO);
+    if (inputFile != NULL) {
+        fd = open(inputFile, O_RDONLY, 0600);
+    }
+    for (int i = 0; i < numOfPIPE; i++) {
+        pipe(fds);
+        child_pid = spawn_proc(fd, fds[1], arrayOfArgs[i], isBackground);
+        close (fds[1]);
+        fd = fds[0];
+    }
+
+    if (fd != STDIN_FILENO) {
+        dup2 (fd, STDIN_FILENO);
+        close(fd);
+    }
+    if (outputFile != NULL) {
+        fd = open(outputFile, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
+    }
+    child_pid = spawn_proc(STDIN_FILENO, STDOUT_FILENO,
+            arrayOfArgs[numOfPIPE], isBackground);
+    
+    dup2(in, STDIN_FILENO);
+    close(in);
+    dup2(out, STDOUT_FILENO);
+    close(out);
+
+    if (!isBackground) {
+        pid_t pid_tmp;
+        tcsetpgrp(shell_termial, new_pgrp);
+        do {
+            pid_tmp = waitpid(WAIT_ANY, NULL, WUNTRACED);
+        } while (pid_tmp > 0);
+        tcsetpgrp(shell_termial, SH_PGID);
+        tcsetattr(shell_termial, TCSADRAIN, &SH_TMODES);
+    }
+    else {
+        tcsetpgrp(shell_termial, SH_PGID);
+        tcsetattr(shell_termial, TCSADRAIN, &SH_TMODES);
     }
 }
